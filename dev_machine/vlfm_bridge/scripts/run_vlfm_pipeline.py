@@ -626,6 +626,80 @@ def _tick_perception(idx, target, camera, pose_client, obstacle_map, scene_graph
     }
 
 
+def _make_semantic_map_vis(sem_map: np.ndarray, obstacle_map) -> np.ndarray:
+    """PLASMA heatmap of semantic scores overlaid on explored free space.
+
+    Non-explored cells: dark gray. Obstacles: near-black. Explored: PLASMA
+    colormap, brighter = higher semantic score toward the current target.
+    """
+    size = obstacle_map._map.shape[0]
+    vis = np.full((size, size, 3), 40, dtype=np.uint8)
+    vis[obstacle_map.explored_area.astype(bool)] = 70
+    vis[obstacle_map._navigable_map == 0] = 25
+
+    if sem_map.max() > 1e-6:
+        norm = np.clip(sem_map / sem_map.max(), 0, 1)
+    else:
+        norm = np.zeros_like(sem_map)
+
+    color_img = cv2.applyColorMap((norm * 255).astype(np.uint8), cv2.COLORMAP_PLASMA)
+    mask = obstacle_map.explored_area.astype(bool)
+    vis[mask] = color_img[mask]
+
+    return cv2.flip(vis, 0)
+
+
+def _make_scene_graph_vis(
+    obstacle_map,
+    scored_objects: list,
+    robot_xy: np.ndarray,
+    frontiers: np.ndarray,
+) -> np.ndarray:
+    """Draw scene graph objects and frontiers on a copy of the occupancy map.
+
+    Objects are colored red→green by CLIP score (relative to the current best).
+    Frontiers are shown as small blue circles. Robot is a filled cyan circle.
+
+    Draws in pre-flip map space (same convention as obstacle_map.visualize())
+    then flips at the end, so objects land at correct world positions.
+    """
+    vis = np.ones((*obstacle_map._map.shape[:2], 3), dtype=np.uint8) * 255
+    vis[obstacle_map.explored_area == 1] = (200, 255, 200)
+    vis[obstacle_map._navigable_map == 0] = (150, 150, 150)
+    vis[obstacle_map._map == 1] = (0, 0, 0)
+
+    # Frontiers: small blue circles
+    if len(frontiers) > 0:
+        for f in frontiers:
+            px = obstacle_map._xy_to_px(np.array([[f[0], f[1]]]))[0]
+            cv2.circle(vis, (int(px[0]), int(px[1])), 5, (200, 80, 0), 2)
+
+    # Scene graph objects: colored by score
+    scores = [s for s, _ in scored_objects]
+    max_s = max(scores) if scores else 1.0
+    min_s = min(scores) if scores else 0.0
+    span = max(max_s - min_s, 0.01)
+    for i, (score, world_xy) in enumerate(scored_objects):
+        px = obstacle_map._xy_to_px(world_xy.reshape(1, 2))[0]
+        t = np.clip((score - min_s) / span, 0.0, 1.0)
+        color_bgr = (int(255 * (1 - t)), int(200 * t), int(255 * t))  # red→green
+        cx, cy = int(px[0]), int(px[1])
+        cv2.circle(vis, (cx, cy), 9, color_bgr, -1)
+        cv2.circle(vis, (cx, cy), 9, (0, 0, 0), 1)
+        cv2.putText(vis, f"{score:.2f}", (cx + 11, cy + 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 0, 0), 2)
+        cv2.putText(vis, f"{score:.2f}", (cx + 11, cy + 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, color_bgr, 1)
+
+    # Robot position: filled cyan circle
+    if robot_xy is not None:
+        px = obstacle_map._xy_to_px(np.array([[robot_xy[0], robot_xy[1]]]))[0]
+        cv2.circle(vis, (int(px[0]), int(px[1])), 7, (255, 220, 0), -1)
+        cv2.circle(vis, (int(px[0]), int(px[1])), 7, (0, 0, 0), 1)
+
+    return cv2.flip(vis, 0)
+
+
 def _wrap_pi(a: float) -> float:
     return float((a + np.pi) % (2 * np.pi) - np.pi)
 
@@ -755,7 +829,7 @@ def perform_initial_scan(xy0, yaw0, camera, pose_client, cmdvel_sender,
 def next_run_dir(base_dir: str) -> str:
     path = os.path.join(base_dir, "vlfm_pipeline_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
     os.makedirs(path, exist_ok=True)
-    for sub in ("frames", "occupancy_map", "depth"):
+    for sub in ("frames", "occupancy_map", "semantic_map", "scene_graph", "depth"):
         os.makedirs(os.path.join(path, sub), exist_ok=True)
     return path
 
@@ -1023,13 +1097,26 @@ def main() -> None:
                 else:
                     status += "  [warn] enough hits but no valid depth estimate yet"
 
+            # Compute semantic map + scene graph visualization every tick
+            # (even when locked, so the review video shows full history)
+            if target != cached_target:
+                cached_text_feat = scene_graph.encode_text(target)
+                cached_target = target
+            scored_objects = scene_graph.get_scored_objects(cached_text_feat) if cached_text_feat is not None else []
+            sem_map = compute_semantic_map(obstacle_map, scored_objects)
+            try:
+                cv2.imwrite(
+                    os.path.join(run_dir, "semantic_map", f"tick_{frame_idx:05d}.png"),
+                    _make_semantic_map_vis(sem_map, obstacle_map),
+                )
+                cv2.imwrite(
+                    os.path.join(run_dir, "scene_graph", f"tick_{frame_idx:05d}.png"),
+                    _make_scene_graph_vis(obstacle_map, scored_objects, xy, frontiers),
+                )
+            except Exception as e:
+                log(f"  [warn] vis save failed: {e}")
+
             if target_lock_xy is None and len(frontiers) > 0:
-                # Re-encode text feat only when target changes
-                if target != cached_target:
-                    cached_text_feat = scene_graph.encode_text(target)
-                    cached_target = target
-                scored_objects = scene_graph.get_scored_objects(cached_text_feat)
-                sem_map = compute_semantic_map(obstacle_map, scored_objects)
                 best_idx = select_frontier_by_score(obstacle_map, xy, sem_map)
                 best = frontiers[best_idx]
                 rho, theta = rho_theta(xy, yaw, best)
