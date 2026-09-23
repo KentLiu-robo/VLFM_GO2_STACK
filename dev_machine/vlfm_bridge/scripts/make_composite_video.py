@@ -1,11 +1,11 @@
 """Builds a composite review video for a run_vlfm_pipeline.py run directory:
-first-person camera view on top, occupancy map + value map side by side (equal
-halves) underneath, one video frame per tick, time-aligned by tick index.
+first-person camera view on top, occupancy map underneath, one video frame
+per tick, time-aligned by tick index.
 
-Both maps use the SAME crop window (union of everything drawn across the whole
-run, padded, made square) so they stay co-registered and don't jitter between
-frames. After the target is locked the pipeline stops updating the maps
-(upper layer does no more reasoning), so the last map is held and labeled.
+The map uses a square crop window covering all non-white pixels across the
+whole run (padded). After the target is locked the pipeline stops updating
+the map (upper layer does no more reasoning), so the last map is held and
+labeled.
 
 Usage:
     python make_composite_video.py /home/tommy/Taowen/RES/vlfm_pipeline_XXXX \
@@ -23,7 +23,7 @@ import numpy as np
 
 PANEL_W = 960                      # video width
 FP_H = 720                         # first-person panel (4:3 at PANEL_W)
-MAP_SIDE = PANEL_W // 2            # each map: 480x480, the two split the strip evenly
+MAP_SIDE = PANEL_W                 # occupancy map spans full width
 BG = (24, 24, 24)
 
 
@@ -76,15 +76,14 @@ def main():
 
     frames = load_by_tick(os.path.join(a.run_dir, "frames"), "jpg")
     occ = load_by_tick(os.path.join(a.run_dir, "occupancy_map"), "png")
-    val = load_by_tick(os.path.join(a.run_dir, "value_map"), "png")
     ticks = sorted(frames)
-    assert ticks and occ and val, "need frames/, occupancy_map/, value_map/ in the run dir"
-    last_map_tick = max(min(max(occ), max(val)), 0)
+    assert ticks and occ, "need frames/, occupancy_map/ in the run dir"
+    last_map_tick = max(occ)
     frozen_after = last_map_tick if last_map_tick < ticks[-1] else None
 
-    xs, ys, cw, ch = union_crop(list(occ.values()) + list(val.values()), a.margin)
+    xs, ys, cw, ch = union_crop(list(occ.values()), a.margin)
     print(f"{len(ticks)} ticks, map crop window x={xs} y={ys} size={cw}x{ch} -> {MAP_SIDE}x{MAP_SIDE}"
-          + (f", maps frozen after tick {frozen_after}" if frozen_after else ""))
+          + (f", map frozen after tick {frozen_after}" if frozen_after else ""))
 
     out_path = os.path.join(a.run_dir, a.out)
     if os.path.exists(out_path) and a.keep_orig:
@@ -125,13 +124,10 @@ def main():
             cv2.line(fp, (fx, bar_y - 6), (fx, FP_H), (0, 200, 255), 2)
 
         ko, po = latest_at_or_before(occ, t)
-        kv, pv = latest_at_or_before(val, t)
-        tiles = [map_tile(po, "OCCUPANCY MAP", ko if ko != t else None),
-                 map_tile(pv, "VALUE MAP", kv if kv != t else None)]
+        occ_tile = map_tile(po, "OCCUPANCY MAP", ko if ko != t else None)
         canvas = np.full((H, PANEL_W, 3), BG, np.uint8)
         canvas[:FP_H] = fp
-        canvas[FP_H:, :MAP_SIDE] = tiles[0]
-        canvas[FP_H:, MAP_SIDE:] = tiles[1]
+        canvas[FP_H:] = occ_tile
         ff.stdin.write(canvas.tobytes())
     ff.stdin.close()
     ff.wait()

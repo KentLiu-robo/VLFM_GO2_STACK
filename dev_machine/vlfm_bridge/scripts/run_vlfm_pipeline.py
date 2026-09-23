@@ -75,11 +75,20 @@ from datetime import datetime
 import cv2
 import numpy as np
 
+import open_clip
+import torch
+import torch.nn.functional as _F
+
 from vlfm.mapping.obstacle_map import ObstacleMap
-from vlfm.mapping.value_map import ValueMap
 from vlfm.utils.geometry_utils import rho_theta
-from vlfm.vlm.blip2itm import BLIP2ITMClient
 from vlfm.vlm.yolo_world import YOLOWorldClient, _caption_to_classes
+
+# CGFM modules (dev_machine/cgfm/)
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), "..", "..", "cgfm"))
+from scene_graph import LightweightSceneGraph
+from semantic_map import compute_semantic_map
+from frontier_scorer import select_frontier_by_score
 
 JETSON_HOST = os.environ.get("GO2_JETSON_HOST", "192.168.3.18")
 CAMERA_PORT = 6000
@@ -529,14 +538,13 @@ SCAN_PERCEIVE_TICKS = 2        # perception ticks captured at rest after each st
 SCAN_MAX_DRIFT_M = 1.0         # rotation-only must not translate; abort if it does
 
 
-def _tick_perception(idx, target, camera, pose_client, obstacle_map, value_map,
-                      blip2itm, detector, intr, fx, fy, fov, run_dir, log,
+def _tick_perception(idx, target, camera, pose_client, obstacle_map, scene_graph,
+                      detector, intr, fx, fy, fov, run_dir, log,
                       video_writer=None):
     """One perception+mapping tick, shared by the initial 360-scan and the
-    main explore loop: capture a frame, save it, run detection+ITM scoring,
-    update the obstacle/value maps, save map snapshots. Returns None if
+    main explore loop: capture a frame, save it, run YOLO-World detection,
+    update the obstacle map + scene graph, save snapshots. Returns None if
     pose/camera data wasn't ready yet this tick."""
-    blip_query = f"Seems like there is a {target} ahead."
     det_caption = DET_SYNONYMS.get(target, f"{target} .")
 
     xy_yaw = pose_client.xy_yaw()
@@ -582,11 +590,16 @@ def _tick_perception(idx, target, camera, pose_client, obstacle_map, value_map,
                                     intr["width"], intr["height"], idx, log)
     target_seen = len(valid_idxs) > 0
 
-    try:
-        score = blip2itm.cosine(color, blip_query)
-    except Exception as e:
-        log(f"  [warn] BLIP2ITM failed: {e}")
-        score = 0.0
+    score = 0.0  # BLIP2ITM removed; kept for draw_detections header only
+    if valid_idxs and scene_graph is not None:
+        try:
+            scene_graph.update(
+                color, detections, valid_idxs,
+                depth_raw, intr["depth_scale"],
+                tf_camera_to_episodic, fx, fy,
+            )
+        except Exception as e:
+            log(f"  [warn] scene_graph.update failed: {e}")
 
     det_vis = draw_detections(color_bgr, target, score, detections, valid_idxs)
     cv2.imwrite(os.path.join(run_dir, "frames", f"tick_{idx:05d}.jpg"), det_vis)
@@ -600,17 +613,10 @@ def _tick_perception(idx, target, camera, pose_client, obstacle_map, value_map,
             topdown_fov=fov, explore=True, update_obstacles=True,
         )
         obstacle_map.update_agent_traj(xy, yaw)
-        value_map.update_map(
-            values=np.array([score]), depth=depth_norm, tf_camera_to_episodic=tf_camera_to_episodic,
-            min_depth=MIN_DEPTH, max_depth=MAX_DEPTH, fov=fov,
-        )
-        value_map.update_agent_traj(xy, yaw)
     except IndexError as e:
         log(f"  [warn] pose outside map bounds: {e}")
 
     cv2.imwrite(os.path.join(run_dir, "occupancy_map", f"tick_{idx:05d}.png"), obstacle_map.visualize())
-    cv2.imwrite(os.path.join(run_dir, "value_map", f"tick_{idx:05d}.png"),
-                value_map.visualize(obstacle_map=obstacle_map))
 
     return {
         "xy": xy, "yaw": yaw, "score": score, "target_seen": target_seen,
@@ -686,7 +692,7 @@ def _stop_rotation(cmdvel_sender) -> None:
 
 
 def perform_initial_scan(xy0, yaw0, camera, pose_client, cmdvel_sender,
-                          obstacle_map, value_map, blip2itm, detector,
+                          obstacle_map, scene_graph, detector,
                           intr, fx, fy, fov, run_dir, log, target, frame_idx,
                           video_writer=None, should_stop=lambda: False):
     """Turn a full 360 degrees in SCAN_STEPS steps before exploring, so the
@@ -711,7 +717,7 @@ def perform_initial_scan(xy0, yaw0, camera, pose_client, cmdvel_sender,
             tick_t0 = time.time()
             frame_idx += 1
             result = _tick_perception(frame_idx, target, camera, pose_client, obstacle_map,
-                                       value_map, blip2itm, detector, intr, fx, fy, fov,
+                                       scene_graph, detector, intr, fx, fy, fov,
                                        run_dir, log, video_writer)
             if result is None:
                 frame_idx -= 1
@@ -749,7 +755,7 @@ def perform_initial_scan(xy0, yaw0, camera, pose_client, cmdvel_sender,
 def next_run_dir(base_dir: str) -> str:
     path = os.path.join(base_dir, "vlfm_pipeline_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
     os.makedirs(path, exist_ok=True)
-    for sub in ("frames", "occupancy_map", "value_map", "depth"):
+    for sub in ("frames", "occupancy_map", "depth"):
         os.makedirs(os.path.join(path, sub), exist_ok=True)
     return path
 
@@ -852,8 +858,13 @@ def main() -> None:
         min_height=MIN_HEIGHT, max_height=MAX_HEIGHT, agent_radius=0.2,
         area_thresh=0.5, hole_area_thresh=-1, size=MAP_SIZE, pixels_per_meter=PIXELS_PER_METER,
     )
-    value_map = ValueMap(value_channels=1, size=MAP_SIZE, obstacle_map=obstacle_map)
-    blip2itm = BLIP2ITMClient(port=12182)
+    clip_model, _, clip_preprocess = open_clip.create_model_and_transforms(
+        "ViT-H-14", pretrained="laion2b_s32b_b79k"
+    )
+    clip_model = clip_model.cuda().eval()
+    scene_graph = LightweightSceneGraph(clip_model, clip_preprocess, device="cuda")
+    cached_target: str = ""
+    cached_text_feat = None
     detector = YOLOWorldClient(port=12185)
 
     stdin_reader = StdinCommands()
@@ -884,8 +895,8 @@ def main() -> None:
         # The scan runs FIRST, with pathFollower deliberately NOT started: the
         # scan alone owns /cmd_vel (yaw rate only, via cmdvel_udp_relay.py).
         frame_idx = perform_initial_scan(
-            xy0, yaw0, camera, pose_client, cmdvel_sender, obstacle_map, value_map,
-            blip2itm, detector, intr, fx, fy, fov, run_dir, log, state["target"], 0,
+            xy0, yaw0, camera, pose_client, cmdvel_sender, obstacle_map, scene_graph,
+            detector, intr, fx, fy, fov, run_dir, log, state["target"], 0,
             video_writer, should_stop,
         )
         if should_stop():
@@ -929,6 +940,8 @@ def main() -> None:
                         hit_window.clear()
                         target_lock_xy = None
                         last_way_point = None
+                        cached_target = ""   # force text-feat re-encode on next tick
+                        # scene_graph intentionally NOT cleared: history persists
                         log(f">>> target changed to {new_target!r}")
                 else:
                     log(f"(unrecognized command: {cmd!r})")
@@ -963,7 +976,7 @@ def main() -> None:
                 continue
 
             result = _tick_perception(frame_idx, target, camera, pose_client, obstacle_map,
-                                       value_map, blip2itm, detector, intr, fx, fy, fov,
+                                       scene_graph, detector, intr, fx, fy, fov,
                                        run_dir, log, video_writer)
             if result is None:
                 frame_idx -= 1
@@ -1011,8 +1024,14 @@ def main() -> None:
                     status += "  [warn] enough hits but no valid depth estimate yet"
 
             if target_lock_xy is None and len(frontiers) > 0:
-                sorted_frontiers, _ = value_map.sort_waypoints(frontiers, FRONTIER_SEARCH_RADIUS)
-                best = sorted_frontiers[0]
+                # Re-encode text feat only when target changes
+                if target != cached_target:
+                    cached_text_feat = scene_graph.encode_text(target)
+                    cached_target = target
+                scored_objects = scene_graph.get_scored_objects(cached_text_feat)
+                sem_map = compute_semantic_map(obstacle_map, scored_objects)
+                best_idx = select_frontier_by_score(obstacle_map, xy, sem_map)
+                best = frontiers[best_idx]
                 rho, theta = rho_theta(xy, yaw, best)
                 status += f"  best_frontier=({best[0]:.2f},{best[1]:.2f}) turn={np.rad2deg(theta):+.0f}deg dist={rho:.2f}m"
                 moved = last_way_point is None or np.hypot(
@@ -1043,14 +1062,13 @@ def main() -> None:
             video_writer.release()
             log(f"First-person recording saved to {os.path.join(run_dir, 'first_person.mp4')}")
         cv2.imwrite(os.path.join(run_dir, "go2_obstacle_map_final.png"), obstacle_map.visualize())
-        cv2.imwrite(os.path.join(run_dir, "go2_value_map_final.png"), value_map.visualize(obstacle_map=obstacle_map))
         if video_writer is not None:
             # Robot is already stopped/lying down by now, so this (a few seconds
             # of encoding) can't delay anything safety-relevant. Turns the raw
             # first-person recording into the composite (camera + occupancy map
             # + value map, time-aligned); the raw one is kept as
             # first_person_orig.mp4. Never allowed to break cleanup.
-            log("Building composite review video (camera + occupancy map + value map)...")
+            log("Building composite review video (camera + occupancy map)...")
             try:
                 out = subprocess.run(
                     [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)),
