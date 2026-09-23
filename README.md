@@ -9,18 +9,39 @@ Unitree GO2 四足机器人 + [VLFM](https://github.com/bdaiinstitute/vlfm) 的�
 ```
 VLFM_GO2_STACK/
 ├── dev_machine/            # 开发机 (PC, ROS 2 Jazzy) 端代码
+│   ├── cgfm/               # ★ CGFM 语义建图模块（cgfm 分支新增，见下方说明）
 │   ├── base_autonomy/      # 底层避障导航: local_planner(含pathFollower) / terrain_analysis(+ext) / sensor_scan_generation
-│   ├── slam/                # arise_slam_mid360 (SLAM) + 消息定义包
-│   ├── unitree_webrtc_ros/  # 订阅 /cmd_vel，通过 WebRTC 直接控制机器人本体
-│   ├── vlfm_bridge/         # ★ vlfm ↔ ROS2 的桥接层，见下方"这是什么"
-│   ├── wireless_tools/      # 无线组网模式下的一键拉起/健康检查/关闭脚本
-│   └── utilities/serial/    # local_planner 的编译期依赖（第三方小库，已带）
-├── jetson/                  # Jetson 机载电脑端代码
+│   ├── slam/               # arise_slam_mid360 (SLAM) + 消息定义包
+│   ├── unitree_webrtc_ros/ # 订阅 /cmd_vel，通过 WebRTC 直接控制机器人本体
+│   ├── vlfm_bridge/        # ★ vlfm ↔ ROS2 的桥接层，见下方"这是什么"
+│   ├── wireless_tools/     # 无线组网模式下的一键拉起/健康检查/关闭脚本
+│   └── utilities/serial/   # local_planner 的编译期依赖（第三方小库，已带）
+├── jetson/                 # Jetson 机载电脑端代码
 │   └── realsense_stream_server.py   # 自研的相机 TCP 推流服务，见 jetson/README.md
-└── vlfm_patch/               # 对官方 VLFM 仓库的修改（不是完整 vlfm 仓库），见 vlfm_patch/README.md
+└── vlfm_patch/             # 对官方 VLFM 仓库的修改（不是完整 vlfm 仓库），见 vlfm_patch/README.md
 ```
 
-`dev_machine/vlfm_bridge` 是这个项目里**唯一从零编写**的部分，其余 `dev_machine/` 目录都是对 [`autonomy_stack_mecanum_wheel_platform`](https://github.com/jizhang-cmu/autonomy_stack_mecanum_wheel_platform)（Ji Zhang 组）底层导航算法的复用（未改动核心算法，只改了少量配置/接口，具体见各文件的内联注释）。**没有带**该上游仓库里跟当前 GO2+vlfm 流程无关的部分（模拟环境、route/exploration planner、Mecanum 轮特有的遥操作/串口电机驱动等）。
+`dev_machine/vlfm_bridge` 和 `dev_machine/cgfm` 是这个项目里从零编写的部分，其余 `dev_machine/` 目录都是对 [`autonomy_stack_mecanum_wheel_platform`](https://github.com/jizhang-cmu/autonomy_stack_mecanum_wheel_platform)（Ji Zhang 组）底层导航算法的复用（未改动核心算法，只改了少量配置/接口，具体见各文件的内联注释）。**没有带**该上游仓库里跟当前 GO2+vlfm 流程无关的部分（模拟环境、route/exploration planner、Mecanum 轮特有的遥操作/串口电机驱动等）。
+
+### `dev_machine/cgfm/` — CGFM 语义建图模块（cgfm 分支）
+
+从 [MSGNav](https://github.com/Yuxiang-Xiao/MSGNav)（`origin/CGFM` 分支）提取的最小化语义建图组件，去除所有 Habitat / TSDF 依赖，直接对接 `vlfm_patch/obstacle_map.py`，替换原本的 ValueMap + BLIP-2 方案。
+
+| 文件 | 功能 |
+|------|------|
+| `scene_graph.py` | `LightweightSceneGraph`：YOLO-World bbox 裁图 → open_clip (ViT-H-14) embedding + 深度反投影 3D 世界位置；EMA 融合 (α=0.3) 距离 < 0.5 m 的同一物体；**场景记忆跨目标切换不清空** |
+| `semantic_map.py` | `compute_semantic_map()`：对场景图里每个物体的 CLIP 相似度分数，通过 Dijkstra 测地距离向已探索自由空间扩散，生成 (H,W) 语义热力图 |
+| `frontier_scorer.py` | `select_frontier_by_score()`：`score = 语义邻域均值 / (1 + λ × 测地距离归一化)`；所有分数 ≤ 0.05 时退化为选最近 frontier；内含 BFS Dijkstra 路径距离计算 |
+
+**与 master 分支（原版 VLFM 架构）的主要差异：**
+
+| | master（原版） | cgfm（本 branch） |
+|---|---|---|
+| 语义打分 | BLIP-2 ITM（HTTP :12182） | open_clip ViT-H-14（本地 GPU，约 2 GB 显存） |
+| 地图类型 | ObstacleMap + ValueMap | ObstacleMap + 语义热力图（cgfm/） |
+| Frontier 选择 | `value_map.sort_waypoints()` | `select_frontier_by_score()` |
+| 需要的 Flask 服务 | BLIP-2 (:12182) + YOLO-World (:12185) | 仅 YOLO-World (:12185)，无需启动 BLIP-2 |
+| 复盘视频底部 | 占据地图（全宽） | 占据地图 \| 语义热力图 \| 场景图（三格） |
 
 ## 系统架构与信息流
 
@@ -100,22 +121,45 @@ pathFollower (local_planner 包里的另一个可执行文件，消费 /path + /
 
 ### 4. vlfm 进程内部：决策怎么产生的
 
+**cgfm 分支（本 branch，CLIP + 语义热力图）：**
+
 ```
 相机(TCP 6000)彩色图+深度图+内参  ──┐
-位姿(UDP 8765)                     ├─→ ObstacleMap / ValueMap 更新(vlfm自己的几何+语义建图)
+位姿(UDP 8765)                     ├─→ ObstacleMap 更新（几何建图）
                                     │
-                                    ├─→ 彩色图送本地HTTP:
-                                    │     BLIP2ITM  (localhost:12182, Flask) → 语义匹配分数
-                                    │     YOLO-World (localhost:12185, Flask) → 目标检测框
+                                    ├─→ YOLO-World (localhost:12185) → bbox
+                                    │     └─→ LightweightSceneGraph（open_clip ViT-H-14，本地GPU）
+                                    │           bbox裁图 → CLIP embedding + 深度反投影 3D 位置
+                                    │           EMA 融合同一物体；跨目标切换不清空
+                                    │
+                                    ├─→ compute_semantic_map()
+                                    │     CLIP cos相似度 → Dijkstra 测地扩散 → (H,W) 热力图
                                     │
                                     ▼
-                            frontier 打分 → 选出下一个探索点(或已连续多帧检测到目标→锁定目标世界坐标)
+                        select_frontier_by_score() → 语义加权 frontier 打分
+                        (或已连续多帧检测到目标→锁定目标世界坐标)
                                     │
                                     ▼
                         waypoint_udp_relay(UDP 8766) → /way_point
 ```
 
-BLIP-2 和 YOLO-World 也在本机内，走最普通的 HTTP POST + JSON（vlfm 自带的 `server_wrapper.py`），跟 ROS、跟 Jetson 都没关系。YOLO-World 检测器（`vlfm_patch/yolo_world.py`）是本项目新增的，用它替换了原本闭集的 YOLOv7，见 [`vlfm_patch/README.md`](vlfm_patch/README.md)。
+**master 分支（原版，BLIP-2 + ValueMap）：**
+
+```
+相机(TCP 6000)彩色图+深度图+内参  ──┐
+位姿(UDP 8765)                     ├─→ ObstacleMap / ValueMap 更新
+                                    │
+                                    ├─→ BLIP2ITM  (localhost:12182, Flask) → 语义匹配分数
+                                    │   YOLO-World (localhost:12185, Flask) → 目标检测框
+                                    │
+                                    ▼
+                            value_map.sort_waypoints() → frontier 打分
+                                    │
+                                    ▼
+                        waypoint_udp_relay(UDP 8766) → /way_point
+```
+
+YOLO-World 检测器（`vlfm_patch/yolo_world.py`）是本项目新增的，用它替换了原本闭集的 YOLOv7，见 [`vlfm_patch/README.md`](vlfm_patch/README.md)。cgfm 分支不再需要启动 BLIP-2 服务（端口 12182）。
 
 ### 5. 开发机 → GO2 本体：WebRTC，直接对机器人，不经过 Jetson
 
@@ -144,10 +188,25 @@ GO2 本体运动控制器执行
 
 见 [`QUICKSTART.md`](QUICKSTART.md)。
 
+## CGFM 分支新增依赖
+
+在 master 分支所需依赖基础上，cgfm 分支额外需要：
+
+```bash
+pip install open-clip-torch
+```
+
+| 包 | 用途 | 备注 |
+|---|---|---|
+| `open-clip-torch` | `open_clip.create_model_and_transforms("ViT-H-14", pretrained="laion2b_s32b_b79k")` | 约 2 GB 显存；首次运行自动下载权重（~3 GB） |
+
+移除的依赖：
+- **BLIP-2 ITM Flask 服务**（端口 12182）不再需要，可跳过 `QUICKSTART.md` 中启动 BLIP-2 服务的步骤。
+
 ## Credits
 
 底层导航栈（`dev_machine/base_autonomy`、`dev_machine/slam`）fork 自 [Ji Zhang's](https://frc.ri.cmu.edu/~zhangji) 团队（Carnegie Mellon University）的 [`autonomy_stack_mecanum_wheel_platform`](https://github.com/jizhang-cmu/autonomy_stack_mecanum_wheel_platform) / [`autonomy_stack_go2`](https://github.com/jizhang-cmu/autonomy_stack_go2)。SLAM 模块是 [LOAM](https://github.com/cuitaixiang/LOAM_NOTED) 的升级实现，底层避障导航基于 [Autonomous Exploration Development Environment](https://www.cmu-exploration.com)。
 
-语义目标导航基于 [VLFM](https://github.com/bdaiinstitute/vlfm)（Boston Dynamics AI Institute）的 ObstacleMap/ValueMap 前沿探索方法，检测器为 [YOLO-World](https://github.com/AILab-CVC/YOLO-World)（经 [ultralytics](https://github.com/ultralytics/ultralytics) 封装），语义打分为 BLIP-2 ITM。
+语义目标导航基于 [VLFM](https://github.com/bdaiinstitute/vlfm)（Boston Dynamics AI Institute）的 ObstacleMap/ValueMap 前沿探索方法，检测器为 [YOLO-World](https://github.com/AILab-CVC/YOLO-World)（经 [ultralytics](https://github.com/ultralytics/ultralytics) 封装）。master 分支语义打分为 BLIP-2 ITM；cgfm 分支语义建图（`dev_machine/cgfm/`）移植自 [MSGNav](https://github.com/Yuxiang-Xiao/MSGNav)（`origin/CGFM` 分支），使用 [open_clip](https://github.com/mlfoundations/open_clip) ViT-H-14 替代 BLIP-2。
 
 雷达驱动 [livox_ros_driver2](https://github.com/Livox-SDK/livox_ros_driver2) / [Livox-SDK2](https://github.com/Livox-SDK/Livox-SDK2)、WebRTC 通信库 [unitree_webrtc_connect](https://github.com/VectorRobotics/unitree_webrtc_connect)、SLAM 依赖 [gtsam](https://gtsam.org) / [Ceres Solver](http://ceres-solver.org) / [Sophus](http://github.com/strasdat/Sophus.git)、`dev_machine/utilities/serial` 来自 [wjwwood/serial](https://github.com/wjwwood/serial)，均为第三方开源项目，本仓库均未改动核心代码。
